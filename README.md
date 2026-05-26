@@ -14,5 +14,13 @@ cd ~/IsaacLab_5
   --save_images \
   --use_imu_stabilization
 
-Notes:
-Use a mounted/rigid RealSense camera, not handheld. Save samples only when the hand visualization looks stable. IMU stabilization helps keep the hand visualization stable when the camera rotates slightly. Remaining bad frames are mostly depth/landmark palm flips.
+Current fix:
+- Live RealSense wrist-relative viz is used for cleaner hand shape.
+- Rotation bug: viz sometimes jumped back to the old angle when palm_frame disappeared.
+- Solution: cache the last good palm-normal axis and keep using it for the visual rotation.
+
+Useful notes:
+- Use a mounted/rigid RealSense camera, not handheld.
+- Save samples only when the hand visualization looks stable.
+- IMU stabilization helps keep the hand visualization stable when the camera rotates slightly.
+- Remaining bad frames are mostly depth/landmark palm flips or missing critical palm points.

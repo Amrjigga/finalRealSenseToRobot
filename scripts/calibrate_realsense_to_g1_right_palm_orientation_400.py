@@ -109,6 +109,14 @@ imu_compare_debug_ref = {
     "last_print_t": 0.0,
 }
 
+robust_landmark_state = {
+    "last_good": [None] * 21,
+    "missing_count": [999] * 21,
+    "last_wrist_offset_from_palm_center": None,
+    "frame_idx": 0,
+    "last_quality": {},
+}
+
 palm_continuity_state = {
     "last_good_frame": None,
     "rejected_count": 0,
@@ -846,6 +854,156 @@ def debug_print_palm_orientation_stability(palm_frame):
     )
 
 
+
+def _lm_to_float3(p):
+    import numpy as _np
+    import torch
+
+    if p is None:
+        return None
+
+    try:
+        # torch tensor
+        if hasattr(p, "detach"):
+            arr = p.detach().cpu().numpy().astype("float32").reshape(-1)
+        else:
+            arr = _np.asarray(p, dtype=_np.float32).reshape(-1)
+
+        if arr.shape[0] < 3:
+            return None
+
+        x, y, z = float(arr[0]), float(arr[1]), float(arr[2])
+        if not _np.isfinite([x, y, z]).all():
+            return None
+
+        return [x, y, z]
+    except Exception:
+        return None
+
+
+def _dist3(a, b):
+    import math
+    if a is None or b is None:
+        return None
+    return math.sqrt(
+        (float(a[0]) - float(b[0])) ** 2
+        + (float(a[1]) - float(b[1])) ** 2
+        + (float(a[2]) - float(b[2])) ** 2
+    )
+
+
+def _avg_points(points):
+    vals = [p for p in points if p is not None]
+    if not vals:
+        return None
+    n = float(len(vals))
+    return [
+        sum(float(p[0]) for p in vals) / n,
+        sum(float(p[1]) for p in vals) / n,
+        sum(float(p[2]) for p in vals) / n,
+    ]
+
+
+def robustify_landmarks_for_viz_and_palm(landmarks_3d_isaac, max_hold_frames=1, max_jump_m=1.00):
+    """
+    Robust layer after RealSense + IMU correction.
+
+    Goal:
+      - show hand viz even if non-critical points have bad depth
+      - allow palm orientation when MCPs 5,9,17 are visible
+      - do not hard-require wrist 0; estimate it from last wrist offset
+      - gate sudden bad-depth jumps
+    """
+    state = robust_landmark_state
+    state["frame_idx"] = int(state.get("frame_idx", 0)) + 1
+
+    raw = []
+    for i in range(21):
+        p = None
+        try:
+            p = landmarks_3d_isaac[i]
+        except Exception:
+            p = None
+        raw.append(_lm_to_float3(p))
+
+    out = [None] * 21
+    used_last_good = []
+    rejected_jumps = []
+    raw_valid = []
+
+    # First pass: normal valid points + jump gate + last-good fallback.
+    for i in range(21):
+        p = raw[i]
+        last = state["last_good"][i]
+
+        if p is not None:
+            d = _dist3(p, last)
+            # If one point teleports too far in one frame, depth is probably bad.
+            if d is not None and d > max_jump_m:
+                p = None
+                rejected_jumps.append(i)
+
+        if p is not None:
+            out[i] = p
+            state["last_good"][i] = p
+            state["missing_count"][i] = 0
+            raw_valid.append(i)
+        else:
+            state["missing_count"][i] = int(state["missing_count"][i]) + 1
+            if last is not None and state["missing_count"][i] <= max_hold_frames:
+                out[i] = last
+                used_last_good.append(i)
+
+    # MCP palm center from index/middle/pinky MCPs.
+    palm_center = _avg_points([out[5], out[9], out[17]])
+
+    used_wrist_fallback = False
+
+    # Update wrist offset when wrist + MCPs are available.
+    if out[0] is not None and palm_center is not None:
+        state["last_wrist_offset_from_palm_center"] = [
+            float(out[0][0]) - float(palm_center[0]),
+            float(out[0][1]) - float(palm_center[1]),
+            float(out[0][2]) - float(palm_center[2]),
+        ]
+
+    # If wrist 0 is missing/out of FOV, estimate it from last hand shape.
+    if out[0] is None and palm_center is not None and state.get("last_wrist_offset_from_palm_center") is not None:
+        off = state["last_wrist_offset_from_palm_center"]
+        out[0] = [
+            float(palm_center[0]) + float(off[0]),
+            float(palm_center[1]) + float(off[1]),
+            float(palm_center[2]) + float(off[2]),
+        ]
+        used_wrist_fallback = True
+        used_last_good.append(0)
+
+    # Palm orientation only needs wrist/estimated wrist + MCPs.
+    palm_critical = [0, 5, 9, 17]
+    has_palm_orientation = all(out[i] is not None for i in palm_critical)
+
+    # Viz can still be drawn with partial hand.
+    valid_for_viz = sum(1 for x in raw if x is not None) >= 6
+
+    quality = {
+        "frame_idx": state["frame_idx"],
+        "raw_valid_count": len(raw_valid),
+        "filled_valid_count": sum(1 for x in out if x is not None),
+        "raw_valid": raw_valid,
+        "used_last_good_points": sorted(set(used_last_good)),
+        "rejected_jump_points": sorted(set(rejected_jumps)),
+        "used_wrist_fallback": bool(used_wrist_fallback),
+        "has_palm_orientation": bool(has_palm_orientation),
+        "valid_for_viz": bool(valid_for_viz),
+        "palm_critical_status": {
+            str(i): bool(out[i] is not None) for i in palm_critical
+        },
+    }
+
+    state["last_quality"] = quality
+    return out, quality
+
+
 def apply_palm_orientation_continuity_gate(palm_frame, max_jump_deg=75.0):
     """
     Reject one-frame palm orientation flips.
@@ -1291,41 +1449,81 @@ def realsense_thread():
                     depth_frame, intr, landmarks, w, h
                 )
 
-                valid_pts = [p for p in landmarks_3d_isaac if p[0] is not None]
-                valid = len(valid_pts) >= 15
+                # IMU V2 correction path.
+                # deproject_landmarks gives raw camera-frame landmarks in landmarks_3d_cam.
+                if args_cli.use_imu_stabilization and landmarks_3d_cam is not None:
+                    raw_landmarks_3d_camera_for_imu_cmp = list(landmarks_3d_cam)
+
+                    alt_landmarks_3d_camera_for_imu_cmp = stabilize_landmarks_with_imu_v2_alt_camera_frame(
+                        raw_landmarks_3d_camera_for_imu_cmp
+                    )
+
+                    current_landmarks_3d_camera_for_imu_cmp = stabilize_landmarks_with_imu_v2_camera_frame(
+                        raw_landmarks_3d_camera_for_imu_cmp
+                    )
+
+                    # Keep this debug for now. It confirms current IMU correction vs raw/alt.
+                    debug_compare_imu_corrections(
+                        raw_landmarks_3d_camera_for_imu_cmp,
+                        current_landmarks_3d_camera_for_imu_cmp,
+                        alt_landmarks_3d_camera_for_imu_cmp,
+                    )
+
+                    landmarks_3d_isaac = [
+                        safe_rs_point_to_isaac_for_debug(pp)
+                        for pp in current_landmarks_3d_camera_for_imu_cmp
+                    ]
+
+                # LIVE VIZ LANDMARKS:
+                # Keep a copy of live RealSense/IMU-corrected points for drawing.
+                # The visual hand shape should use these directly, not robust/fallback points.
+                latest_rs["landmarks_3d_isaac_viz_live"] = [
+                    _lm_to_float3(_p) for _p in landmarks_3d_isaac
+                ]
+
+                # NO-ESTIMATION MODE:
+                # Use live RealSense/IMU-corrected landmarks directly.
+                # No last-good fill, no wrist estimation, no jump correction.
+                live_valid = []
+                for _i, _p in enumerate(landmarks_3d_isaac):
+                    _pp = _lm_to_float3(_p)
+                    landmarks_3d_isaac[_i] = _pp
+                    if _pp is not None:
+                        live_valid.append(_i)
+
+                palm_critical = [0, 5, 9, 17]
+                palm_quality = {
+                    "mode": "live_realsense_only_no_estimation",
+                    "raw_valid_count": len(live_valid),
+                    "filled_valid_count": len(live_valid),
+                    "raw_valid": live_valid,
+                    "used_last_good_points": [],
+                    "rejected_jump_points": [],
+                    "used_wrist_fallback": False,
+                    "has_palm_orientation": all(landmarks_3d_isaac[i] is not None for i in palm_critical),
+                    "valid_for_viz": len(live_valid) >= 6,
+                    "palm_critical_status": {
+                        str(i): bool(landmarks_3d_isaac[i] is not None) for i in palm_critical
+                    },
+                }
+
+                valid = bool(palm_quality.get("valid_for_viz", False))
 
                 if valid:
-                    # IMU V2 diagnostic/correction path.
-                    # deproject_landmarks gives raw camera-frame landmarks in landmarks_3d_cam.
-                    # Apply current + alt IMU corrections here because this is the active RealSense path.
-                    if args_cli.use_imu_stabilization and landmarks_3d_cam is not None:
-                        raw_landmarks_3d_camera_for_imu_cmp = list(landmarks_3d_cam)
+                    palm_frame = None
 
-                        alt_landmarks_3d_camera_for_imu_cmp = stabilize_landmarks_with_imu_v2_alt_camera_frame(
-                            raw_landmarks_3d_camera_for_imu_cmp
-                        )
+                    if palm_quality.get("has_palm_orientation", False):
+                        palm_frame = estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
+                        if palm_frame is None:
+                            palm_frame = loose_estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
 
-                        current_landmarks_3d_camera_for_imu_cmp = stabilize_landmarks_with_imu_v2_camera_frame(
-                            raw_landmarks_3d_camera_for_imu_cmp
-                        )
-
-                        debug_compare_imu_corrections(
-                            raw_landmarks_3d_camera_for_imu_cmp,
-                            current_landmarks_3d_camera_for_imu_cmp,
-                            alt_landmarks_3d_camera_for_imu_cmp,
-                        )
-
-                        landmarks_3d_isaac = [
-                            safe_rs_point_to_isaac_for_debug(pp)
-                            for pp in current_landmarks_3d_camera_for_imu_cmp
-                        ]
-
-                    palm_frame = estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
-                    if palm_frame is None:
-                        palm_frame = loose_estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
                     palm_frame = apply_palm_orientation_continuity_gate(palm_frame, max_jump_deg=75.0)
 
+                    if palm_frame is not None:
+                        palm_frame["quality"] = palm_quality
+
                     latest_rs["palm_frame"] = palm_frame
+                    latest_rs["palm_quality"] = palm_quality
                     debug_print_palm_orientation_stability(palm_frame)
 
                 for a, b in MP_CONNECTIONS:
@@ -1451,92 +1649,160 @@ def draw_axis_frame(draw, origin, quat, scale=0.12, z_offset=0.0):
 
 def draw_realsense_hand(draw, robot_wrist_pos, scale=0.75):
     """
-    Draw RealSense hand using the same alignment idea as the old VR script:
+    Live RealSense-first wrist-relative hand viz.
 
-      world = robot_wrist_pos + (p_isaac - rs_origin) * scale + visual_offset
+    This copies the good idea from the older recorded-RealSense viewer:
+      world_wrist = robot wrist anchor + visual offset
+      rel = landmark - live_wrist
+      world_point = world_wrist + rel * scale
 
-    This keeps the hand near the robot while preserving the hand's relative 3D shape
-    and orientation. Position is only for visualization; calibration is orientation-only.
+    Important:
+      - Uses LIVE IMU-corrected RealSense landmarks for shape.
+      - Does NOT use robust/fallback landmarks for visual finger shape.
+      - Does NOT affect saved palm orientation/calibration data.
+      - Keeps the locked 45-degree viz angle.
     """
     if draw is None:
         return
 
-    pts = latest_rs.get("landmarks_3d_isaac")
-    if not pts:
+    landmarks = latest_rs.get("landmarks_3d_isaac_viz_live")
+    if landmarks is None:
+        landmarks = latest_rs.get("landmarks_3d_isaac")
+
+    if landmarks is None or len(landmarks) < 21:
         return
 
-    wrist = pts[0]
-    if wrist is None or len(wrist) != 3 or any(v is None for v in wrist):
+    live = []
+    for _p in landmarks:
+        try:
+            live.append(_lm_to_float3(_p))
+        except Exception:
+            live.append(None)
+
+    raw_wrist = live[0]
+    if raw_wrist is None:
+        # Viz should not invent the whole hand. If wrist is not visible,
+        # skip this frame instead of distorting the hand shape.
         return
 
-    robot_wrist_pos = torch.as_tensor(robot_wrist_pos, dtype=torch.float32)
-    device = robot_wrist_pos.device
+    import torch
 
-    wrist_t = torch.tensor(wrist, dtype=torch.float32, device=device)
+    wrist_t = torch.tensor(raw_wrist, dtype=torch.float32, device=args_cli.device)
 
-    # Same concept as quest_origin in old VR script:
-    # lock the first valid wrist as the local origin.
-    if latest_rs.get("rs_origin_isaac") is None:
-        latest_rs["rs_origin_isaac"] = wrist_t.detach().cpu().tolist()
-        print("[RS INIT] RealSense origin locked:", latest_rs["rs_origin_isaac"])
+    # Anchor the drawn hand near the robot wrist.
+    base = robot_wrist_pos
+    try:
+        if len(base.shape) == 2:
+            base = base[0]
+    except Exception:
+        pass
 
-    rs_origin = torch.tensor(latest_rs["rs_origin_isaac"], dtype=torch.float32, device=device)
+    visual_offset = torch.tensor([0.28, 0.0, 0.08], dtype=torch.float32, device=args_cli.device)
+    world_wrist = base + visual_offset
 
-    # Visual offset above/near robot wrist. Tune only for display comfort.
-    # Visual offset from robot wrist.
-    # +X = forward, +Y/-Y = side, +Z = up.
-    # Move hand forward and slightly down so it sits near the robot wrist,
-    # not back by the shoulder.
-    visual_offset = torch.tensor([0.28, 0.0, 0.08], dtype=torch.float32, device=device)
-    base = robot_wrist_pos + visual_offset
+    # VIZ ROTATION: rotate inside the palm plane, around the live palm normal.
+    # This turns the hand left/right without flipping palm-up/palm-down.
+    palm_plane_rot_deg = 90.0
+
+    def _rotate_vec_around_axis(v, axis, deg):
+        import math
+        theta = math.radians(float(deg))
+        c = math.cos(theta)
+        ss = math.sin(theta)
+
+        axis = axis / torch.clamp(torch.linalg.norm(axis), min=1e-6)
+
+        # Rodrigues rotation formula.
+        return (
+            v * c
+            + torch.cross(axis, v, dim=0) * ss
+            + axis * torch.dot(axis, v) * (1.0 - c)
+        )
+
+    palm_normal_for_viz = None
+    try:
+        # Use the already-computed/gated palm frame, not raw live MCPs.
+        # Raw live MCPs can be missing, which made the previous palm-normal rotation silently skip.
+        palm_frame_for_viz = latest_rs.get("palm_frame")
+        if palm_frame_for_viz is not None:
+            q_raw = palm_frame_for_viz.get("palm_quat_isaac_wxyz", palm_frame_for_viz.get("quat_wxyz"))
+            if q_raw is not None:
+                q = torch.tensor(q_raw, dtype=torch.float32, device=args_cli.device)
+                q = q / torch.clamp(torch.linalg.norm(q), min=1e-8)
+
+                # quat_wxyz_to_matrix already exists in this script.
+                r = quat_wxyz_to_matrix(q)
+
+                # Palm frame columns are [across, forward, normal].
+                # Normal is the axis that keeps palm-up/down unchanged.
+                palm_normal_for_viz = r[:, 2].to(args_cli.device)
+                palm_normal_for_viz = palm_normal_for_viz / torch.clamp(torch.linalg.norm(palm_normal_for_viz), min=1e-6)
+    except Exception as _e:
+        palm_normal_for_viz = None
+
+    # IMPORTANT:
+    # Do not let viz rotation jump back to OG when palm_frame disappears.
+    # Cache the last good palm-normal axis and keep using it.
+    if not hasattr(draw_realsense_hand, "_locked_viz_palm_axis"):
+        draw_realsense_hand._locked_viz_palm_axis = None
+
+    if palm_normal_for_viz is not None:
+        if draw_realsense_hand._locked_viz_palm_axis is not None:
+            prev = draw_realsense_hand._locked_viz_palm_axis.to(args_cli.device)
+
+            # Prevent axis sign flips. +axis with +90 and -axis with +90 look opposite.
+            if torch.dot(prev, palm_normal_for_viz) < 0:
+                palm_normal_for_viz = -palm_normal_for_viz
+
+            # Light smoothing so the visual rotation axis does not jitter.
+            palm_normal_for_viz = 0.90 * prev + 0.10 * palm_normal_for_viz
+            palm_normal_for_viz = palm_normal_for_viz / torch.clamp(torch.linalg.norm(palm_normal_for_viz), min=1e-6)
+
+        draw_realsense_hand._locked_viz_palm_axis = palm_normal_for_viz.detach().clone()
+    else:
+        palm_normal_for_viz = draw_realsense_hand._locked_viz_palm_axis
+        if palm_normal_for_viz is not None:
+            palm_normal_for_viz = palm_normal_for_viz.to(args_cli.device)
+
+    if not hasattr(draw_realsense_hand, "_dbg_count"):
+        draw_realsense_hand._dbg_count = 0
+    draw_realsense_hand._dbg_count += 1
+    if draw_realsense_hand._dbg_count % 60 == 0:
+        print("[VIZ ROT]", "axis_available_or_cached=", palm_normal_for_viz is not None, "deg=", palm_plane_rot_deg)
+
+    hand_shape_scale = 0.65
 
     point_map = {}
     points = []
 
-    for i, p in enumerate(pts):
-        if p is None or len(p) != 3 or any(v is None for v in p):
+    for i, pp in enumerate(live):
+        if pp is None:
             continue
 
-        pp = torch.tensor(p, dtype=torch.float32, device=device)
+        pp_t = torch.tensor(pp, dtype=torch.float32, device=args_cli.device)
+        rel = pp_t - wrist_t
 
-        # VR-style relative alignment, with visual-only 90 deg left rotation.
-        # Rotate around the locked RealSense origin, not around world.
-        rel = pp - rs_origin
+        if palm_normal_for_viz is not None:
+            rel = _rotate_vec_around_axis(rel, palm_normal_for_viz, palm_plane_rot_deg)
 
-        # +90 deg around Isaac Z/up axis. If this is the wrong direction,
-        # change the matrix to [[0, 1, 0], [-1, 0, 0], [0, 0, 1]].
-        rot_left_90 = torch.tensor(
-            [
-                [0.0, -1.0, 0.0],
-                [1.0,  0.0, 0.0],
-                [0.0,  0.0, 1.0],
-            ],
-            dtype=torch.float32,
-            device=device,
-        )
-
-        rel = rot_left_90 @ rel
-        world = base + rel * scale
-
+        world = world_wrist + rel * hand_shape_scale
         tup = tuple(float(v) for v in world.detach().cpu().tolist())
+
         point_map[i] = tup
         points.append(tup)
 
     if points:
-        draw.draw_points(points, [(1.0, 0.35, 0.0, 1.0)] * len(points), [8.0] * len(points))
+        draw.draw_points(points, [(1.0, 0.45, 0.0, 1.0)] * len(points), [7.0] * len(points))
 
-    starts = []
-    ends = []
+    starts, ends = [], []
     for a, b in MP_CONNECTIONS:
         if a in point_map and b in point_map:
             starts.append(point_map[a])
             ends.append(point_map[b])
 
     if starts:
-        draw.draw_lines(starts, ends, [(1.0, 0.35, 0.0, 1.0)] * len(starts), [2.0] * len(starts))
+        draw.draw_lines(starts, ends, [(1.0, 0.45, 0.0, 1.0)] * len(starts), [2.5] * len(starts))
 
-
-@configclass
 class SceneCfg(InteractiveSceneCfg):
     ground = AssetBaseCfg(
         prim_path="/World/defaultGroundPlane",
