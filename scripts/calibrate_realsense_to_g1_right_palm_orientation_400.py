@@ -83,11 +83,34 @@ MP_CONNECTIONS = [
     (0, 17), (17, 18), (18, 19), (19, 20),
 ]
 
+imu_compare_debug_ref = {
+    "raw": None,
+    "current": None,
+    "alt": None,
+    "last_print_t": 0.0,
+}
+
+palm_continuity_state = {
+    "last_good_frame": None,
+    "rejected_count": 0,
+}
+
+orientation_debug_ref = {
+    "quat": None,
+    "last_print_t": 0.0,
+}
+
 latest_imu = {
     "enabled": False,
     "initial_gravity": None,
     "gravity": None,
     "frame_count": 0,
+    "gyro_enabled": False,
+    "orientation_R": None,
+    "last_gyro_ts": None,
+    "gyro_frame_count": 0,
+    "R_depth_from_imu": None,
+    "R_imu_from_depth": None,
 }
 
 latest_rs = {
@@ -98,6 +121,12 @@ latest_rs = {
     "valid": False,
     "time": 0.0,
     "frame_count": 0,
+    "gyro_enabled": False,
+    "orientation_R": None,
+    "last_gyro_ts": None,
+    "gyro_frame_count": 0,
+    "R_depth_from_imu": None,
+    "R_imu_from_depth": None,
 }
 
 input_events = []
@@ -446,6 +475,524 @@ def stabilize_landmarks_with_imu_camera_frame(landmarks_3d_camera):
     return out
 
 
+
+def so3_exp_np(w):
+    """
+    Rodrigues exponential map.
+    w = angular delta vector in radians.
+    """
+    import numpy as _np
+
+    w = _np.asarray(w, dtype=_np.float32)
+    theta = float(_np.linalg.norm(w))
+
+    if theta < 1e-8:
+        return _np.eye(3, dtype=_np.float32)
+
+    k = w / theta
+    K = _np.array(
+        [
+            [0.0, -k[2], k[1]],
+            [k[2], 0.0, -k[0]],
+            [-k[1], k[0], 0.0],
+        ],
+        dtype=_np.float32,
+    )
+
+    R = (
+        _np.eye(3, dtype=_np.float32)
+        + _np.sin(theta) * K
+        + (1.0 - _np.cos(theta)) * (K @ K)
+    )
+    return R.astype(_np.float32)
+
+
+def imu_v2_update_from_frames(frames):
+    """
+    V2 IMU update:
+    - accel locks initial gravity and keeps latest gravity
+    - gyro integrates full camera rotation, including yaw
+    """
+    import numpy as _np
+    import pyrealsense2 as rs
+
+    # Accel/gravity update
+    accel_frame = frames.first_or_default(rs.stream.accel)
+    if accel_frame:
+        mf = accel_frame.as_motion_frame()
+        if mf:
+            md = mf.get_motion_data()
+            g = [float(md.x), float(md.y), float(md.z)]
+            latest_imu["gravity"] = g
+            latest_imu["frame_count"] = int(latest_imu.get("frame_count", 0)) + 1
+
+            if latest_imu.get("initial_gravity") is None:
+                latest_imu["initial_gravity"] = g
+                print("[IMU INIT] initial gravity locked:", g)
+
+    # Gyro integration update
+    gyro_frame = frames.first_or_default(rs.stream.gyro)
+    if gyro_frame:
+        mf = gyro_frame.as_motion_frame()
+        if mf:
+            ts = float(gyro_frame.get_timestamp()) * 0.001  # ms -> seconds
+            md = mf.get_motion_data()
+
+            # RealSense gyro is rad/s.
+            w = -_np.array([float(md.x), float(md.y), float(md.z)], dtype=_np.float32)
+
+            if latest_imu.get("orientation_R") is None:
+                latest_imu["orientation_R"] = _np.eye(3, dtype=_np.float32)
+                latest_imu["last_gyro_ts"] = ts
+                latest_imu["gyro_frame_count"] = 0
+                print("[IMU V2 INIT] gyro orientation locked")
+                return
+
+            last_ts = latest_imu.get("last_gyro_ts")
+            if last_ts is None:
+                latest_imu["last_gyro_ts"] = ts
+                return
+
+            dt = ts - float(last_ts)
+            latest_imu["last_gyro_ts"] = ts
+
+            # Reject weird timestamps.
+            if dt <= 0.0 or dt > 0.10:
+                return
+
+            R = _np.asarray(latest_imu["orientation_R"], dtype=_np.float32)
+
+            # Body-frame gyro update: R initial->current.
+            dR = so3_exp_np(w * dt)
+            R = dR @ R
+
+            # Keep matrix numerically orthonormal.
+            if int(latest_imu.get("gyro_frame_count", 0)) % 30 == 0:
+                u, _, vh = _np.linalg.svd(R)
+                R = (u @ vh).astype(_np.float32)
+
+            latest_imu["orientation_R"] = R
+            latest_imu["gyro_frame_count"] = int(latest_imu.get("gyro_frame_count", 0)) + 1
+
+
+def stabilize_landmarks_with_imu_v2_camera_frame(landmarks_3d_camera):
+    """
+    V2 stabilization:
+    Uses integrated gyro orientation to rotate current camera-frame landmarks
+    back into the initial camera frame.
+
+    This handles yaw better than V1.
+    """
+    import numpy as _np
+
+    if not latest_imu.get("enabled"):
+        return landmarks_3d_camera
+
+    R = latest_imu.get("orientation_R")
+    if R is None:
+        # fallback to V1 gravity-only correction while gyro initializes
+        return stabilize_landmarks_with_imu_camera_frame(landmarks_3d_camera)
+
+    R = _np.asarray(R, dtype=_np.float32)
+
+    # R maps initial IMU frame -> current IMU frame.
+    # Landmarks are in depth/camera frame, not IMU frame.
+    #
+    # Correction:
+    #   p_imu_current = R_imu_from_depth @ p_depth_current
+    #   p_imu_initial = R.T @ p_imu_current
+    #   p_depth_initial = R_depth_from_imu @ p_imu_initial
+    R_depth_from_imu = latest_imu.get("R_depth_from_imu")
+    R_imu_from_depth = latest_imu.get("R_imu_from_depth")
+
+    if R_depth_from_imu is not None and R_imu_from_depth is not None:
+        R_depth_from_imu = _np.asarray(R_depth_from_imu, dtype=_np.float32)
+        R_imu_from_depth = _np.asarray(R_imu_from_depth, dtype=_np.float32)
+        R_corr = R_depth_from_imu @ R.T @ R_imu_from_depth
+    else:
+        # fallback: old wrong-ish behavior if extrinsics are unavailable
+        R_corr = R.T
+
+    out = []
+    for p in landmarks_3d_camera:
+        if p is None or len(p) != 3 or any(v is None for v in p):
+            out.append(None)
+            continue
+
+        q = R_corr @ _np.asarray(p, dtype=_np.float32)
+        out.append([float(q[0]), float(q[1]), float(q[2])])
+
+    return out
+
+
+
+def imu_v2_update_from_motion_frame(frame):
+    """
+    Update IMU state from a single RealSense motion frame.
+
+    This is the important V2 fix. RealSense motion frames often arrive as
+    individual callback frames, not inside the normal video wait_for_frames()
+    frameset.
+    """
+    import numpy as _np
+    import pyrealsense2 as rs
+
+    motion = frame.as_motion_frame()
+    if not motion:
+        return
+
+    st = motion.get_profile().stream_type()
+    md = motion.get_motion_data()
+
+    if st == rs.stream.accel:
+        g = [float(md.x), float(md.y), float(md.z)]
+        latest_imu["gravity"] = g
+        latest_imu["frame_count"] = int(latest_imu.get("frame_count", 0)) + 1
+
+        if latest_imu.get("initial_gravity") is None:
+            latest_imu["initial_gravity"] = g
+            print("[IMU INIT] initial gravity locked:", g)
+
+    elif st == rs.stream.gyro:
+        ts = float(frame.get_timestamp()) * 0.001  # ms -> seconds
+
+        # RealSense gyro is rad/s.
+        # If correction is backwards, flip this sign later.
+        w = -_np.array([float(md.x), float(md.y), float(md.z)], dtype=_np.float32)
+
+        if latest_imu.get("orientation_R") is None:
+            latest_imu["orientation_R"] = _np.eye(3, dtype=_np.float32)
+            latest_imu["last_gyro_ts"] = ts
+            latest_imu["gyro_frame_count"] = 0
+            print("[IMU V2 INIT] gyro orientation locked")
+            return
+
+        last_ts = latest_imu.get("last_gyro_ts")
+        if last_ts is None:
+            latest_imu["last_gyro_ts"] = ts
+            return
+
+        dt = ts - float(last_ts)
+        latest_imu["last_gyro_ts"] = ts
+
+        if dt <= 0.0 or dt > 0.10:
+            return
+
+        R = _np.asarray(latest_imu["orientation_R"], dtype=_np.float32)
+        dR = so3_exp_np(w * dt)
+        R = dR @ R
+
+        if int(latest_imu.get("gyro_frame_count", 0)) % 30 == 0:
+            u, _, vh = _np.linalg.svd(R)
+            R = (u @ vh).astype(_np.float32)
+
+        latest_imu["orientation_R"] = R
+        latest_imu["gyro_frame_count"] = int(latest_imu.get("gyro_frame_count", 0)) + 1
+
+
+def start_realsense_motion_module_v2(accel_fps=100, gyro_fps=200, depth_profile=None):
+    """
+    Start D435i Motion Module directly with a callback.
+    Keeps video/depth pipeline separate.
+    """
+    import pyrealsense2 as rs
+
+    ctx = rs.context()
+    devices = ctx.query_devices()
+    if len(devices) == 0:
+        print("[IMU WARN] no RealSense device found for motion module")
+        return None
+
+    dev = devices[0]
+
+    motion_sensor = None
+    for sensor in dev.query_sensors():
+        name = sensor.get_info(rs.camera_info.name)
+        if "Motion" in name:
+            motion_sensor = sensor
+            break
+
+    if motion_sensor is None:
+        print("[IMU WARN] Motion Module sensor not found")
+        return None
+
+    profiles = list(motion_sensor.get_stream_profiles())
+
+    accel_profile = None
+    gyro_profile = None
+
+    for prof in profiles:
+        if prof.stream_type() == rs.stream.accel and prof.format() == rs.format.motion_xyz32f and prof.fps() == accel_fps:
+            accel_profile = prof
+        if prof.stream_type() == rs.stream.gyro and prof.format() == rs.format.motion_xyz32f and prof.fps() == gyro_fps:
+            gyro_profile = prof
+
+    if accel_profile is None:
+        print("[IMU WARN] accel profile", accel_fps, "not found")
+    if gyro_profile is None:
+        print("[IMU WARN] gyro profile", gyro_fps, "not found")
+
+    open_profiles = [p for p in [accel_profile, gyro_profile] if p is not None]
+    if not open_profiles:
+        print("[IMU WARN] no usable IMU profiles")
+        return None
+
+    latest_imu["enabled"] = True
+    latest_imu["gyro_enabled"] = gyro_profile is not None
+
+    # Get official RealSense extrinsics between Motion Module / gyro frame
+    # and the depth camera frame. Landmarks are depth/camera-frame points,
+    # while gyro integration is IMU-frame rotation.
+    if depth_profile is not None and gyro_profile is not None:
+        try:
+            import numpy as _np
+            ex = gyro_profile.get_extrinsics_to(depth_profile)
+            R_depth_from_imu = _np.asarray(ex.rotation, dtype=_np.float32).reshape(3, 3)
+            latest_imu["R_depth_from_imu"] = R_depth_from_imu
+            latest_imu["R_imu_from_depth"] = R_depth_from_imu.T
+            print("[IMU V2] depth<-imu extrinsics R:")
+            print(R_depth_from_imu)
+        except Exception as e:
+            print("[IMU WARN] failed to read gyro->depth extrinsics:", e)
+
+    motion_sensor.open(open_profiles)
+    motion_sensor.start(lambda frame: imu_v2_update_from_motion_frame(frame))
+
+    print("[IMU V2] Motion Module callback started:",
+          "accel", accel_fps if accel_profile else None,
+          "gyro", gyro_fps if gyro_profile else None)
+
+    return motion_sensor
+
+
+
+def quat_angle_deg_debug(q1, q2):
+    import math
+    import numpy as _np
+
+    if q1 is None or q2 is None:
+        return None
+
+    q1 = _np.asarray(q1, dtype=_np.float32)
+    q2 = _np.asarray(q2, dtype=_np.float32)
+
+    n1 = float(_np.linalg.norm(q1))
+    n2 = float(_np.linalg.norm(q2))
+    if n1 < 1e-8 or n2 < 1e-8:
+        return None
+
+    q1 = q1 / n1
+    q2 = q2 / n2
+
+    # q and -q are the same rotation, so use abs(dot)
+    dot = abs(float(_np.dot(q1, q2)))
+    dot = max(-1.0, min(1.0, dot))
+
+    return math.degrees(2.0 * math.acos(dot))
+
+
+def debug_print_palm_orientation_stability(palm_frame):
+    """
+    Hold your hand still. Rotate the camera.
+    If this angle stays small, saved orientation is stable and the problem is visual.
+    If this angle changes a lot, IMU stabilization is not correcting the palm orientation yet.
+    """
+    import time
+
+    if palm_frame is None:
+        return
+
+    q = palm_frame.get("palm_quat_isaac_wxyz", palm_frame.get("quat_wxyz"))
+    if q is None:
+        return
+
+    if orientation_debug_ref["quat"] is None:
+        orientation_debug_ref["quat"] = list(q)
+        print("[ORI DEBUG] locked reference palm quat:", orientation_debug_ref["quat"])
+        return
+
+    now = time.time()
+    if now - float(orientation_debug_ref.get("last_print_t", 0.0)) < 0.75:
+        return
+
+    orientation_debug_ref["last_print_t"] = now
+
+    deg = quat_angle_deg_debug(orientation_debug_ref["quat"], q)
+
+    print(
+        "[ORI DEBUG]",
+        "palm_delta_deg_from_ref=", round(float(deg), 2) if deg is not None else None,
+        "imu_gyro_frames=", latest_imu.get("gyro_frame_count"),
+        "imu_accel_frames=", latest_imu.get("frame_count"),
+    )
+
+
+def apply_palm_orientation_continuity_gate(palm_frame, max_jump_deg=75.0):
+    """
+    Reject one-frame palm orientation flips.
+
+    This handles cases where depth/landmark noise makes the palm axes suddenly
+    flip by ~150-180 degrees even though the real hand did not move that much.
+
+    For calibration:
+      - display can keep last good palm frame
+      - saving should avoid these rejected frames
+    """
+    if palm_frame is None:
+        return None
+
+    q = palm_frame.get("palm_quat_isaac_wxyz", palm_frame.get("quat_wxyz"))
+    if q is None:
+        return palm_frame
+
+    last = palm_continuity_state.get("last_good_frame")
+    if last is None:
+        palm_frame["continuity_rejected"] = False
+        palm_continuity_state["last_good_frame"] = palm_frame
+        return palm_frame
+
+    last_q = last.get("palm_quat_isaac_wxyz", last.get("quat_wxyz"))
+    deg = quat_angle_deg_debug(last_q, q)
+
+    if deg is not None and deg > max_jump_deg:
+        palm_continuity_state["rejected_count"] = int(palm_continuity_state.get("rejected_count", 0)) + 1
+
+        # Return last good palm orientation instead of the bad flipped one.
+        stable = dict(last)
+        stable["continuity_rejected"] = True
+        stable["rejected_raw_delta_deg"] = float(deg)
+
+        if palm_continuity_state["rejected_count"] % 10 == 1:
+            print(
+                "[PALM GATE] rejected palm flip:",
+                round(float(deg), 2),
+                "deg, total=",
+                palm_continuity_state["rejected_count"],
+            )
+
+        return stable
+
+    palm_frame["continuity_rejected"] = False
+    palm_frame["raw_delta_from_last_good_deg"] = float(deg) if deg is not None else None
+    palm_continuity_state["last_good_frame"] = palm_frame
+    return palm_frame
+
+
+
+def stabilize_landmarks_with_imu_v2_alt_camera_frame(landmarks_3d_camera):
+    """
+    Alternate IMU correction formula for diagnosis.
+
+    Current formula:
+      R_corr = R_depth_from_imu @ R.T @ R_imu_from_depth
+
+    Alt formula:
+      R_corr = R_depth_from_imu @ R @ R_imu_from_depth
+
+    We compare live and keep whichever gives lower orientation drift.
+    """
+    import numpy as _np
+
+    if not latest_imu.get("enabled"):
+        return landmarks_3d_camera
+
+    R = latest_imu.get("orientation_R")
+    if R is None:
+        return landmarks_3d_camera
+
+    R = _np.asarray(R, dtype=_np.float32)
+
+    R_depth_from_imu = latest_imu.get("R_depth_from_imu")
+    R_imu_from_depth = latest_imu.get("R_imu_from_depth")
+
+    if R_depth_from_imu is not None and R_imu_from_depth is not None:
+        R_depth_from_imu = _np.asarray(R_depth_from_imu, dtype=_np.float32)
+        R_imu_from_depth = _np.asarray(R_imu_from_depth, dtype=_np.float32)
+        R_corr = R_depth_from_imu @ R @ R_imu_from_depth
+    else:
+        R_corr = R
+
+    out = []
+    for p in landmarks_3d_camera:
+        if p is None or len(p) != 3 or any(v is None for v in p):
+            out.append(None)
+            continue
+
+        q = R_corr @ _np.asarray(p, dtype=_np.float32)
+        out.append([float(q[0]), float(q[1]), float(q[2])])
+
+    return out
+
+
+
+def safe_rs_point_to_isaac_for_debug(p):
+    if p is None:
+        return None
+    try:
+        if len(p) != 3:
+            return None
+        if p[0] is None or p[1] is None or p[2] is None:
+            return None
+        return realsense_camera_xyz_to_isaac(p)
+    except Exception:
+        return None
+
+
+def debug_compare_imu_corrections(raw_landmarks_3d_camera, current_landmarks_3d_camera, alt_landmarks_3d_camera):
+    """
+    Live comparison:
+      RAW     = no IMU correction
+      CURRENT = current V2 correction
+      ALT     = alternate R vs R.T correction
+
+    Hold hand still and rotate camera.
+    The best formula is the one with the lowest delta.
+    """
+    import time
+
+    raw_pf = estimate_palm_frame_from_21_landmarks(
+        [safe_rs_point_to_isaac_for_debug(p) for p in raw_landmarks_3d_camera]
+    )
+    cur_pf = estimate_palm_frame_from_21_landmarks(
+        [safe_rs_point_to_isaac_for_debug(p) for p in current_landmarks_3d_camera]
+    )
+    alt_pf = estimate_palm_frame_from_21_landmarks(
+        [safe_rs_point_to_isaac_for_debug(p) for p in alt_landmarks_3d_camera]
+    )
+
+    def get_q(pf):
+        if pf is None:
+            return None
+        return pf.get("palm_quat_isaac_wxyz", pf.get("quat_wxyz"))
+
+    raw_q = get_q(raw_pf)
+    cur_q = get_q(cur_pf)
+    alt_q = get_q(alt_pf)
+
+    if imu_compare_debug_ref["raw"] is None and raw_q is not None:
+        imu_compare_debug_ref["raw"] = list(raw_q)
+        imu_compare_debug_ref["current"] = list(cur_q) if cur_q is not None else None
+        imu_compare_debug_ref["alt"] = list(alt_q) if alt_q is not None else None
+        print("[IMU CMP] locked refs")
+        return
+
+    now = time.time()
+    if now - float(imu_compare_debug_ref.get("last_print_t", 0.0)) < 1.0:
+        return
+    imu_compare_debug_ref["last_print_t"] = now
+
+    raw_deg = quat_angle_deg_debug(imu_compare_debug_ref["raw"], raw_q)
+    cur_deg = quat_angle_deg_debug(imu_compare_debug_ref["current"], cur_q)
+    alt_deg = quat_angle_deg_debug(imu_compare_debug_ref["alt"], alt_q)
+
+    print(
+        "[IMU CMP]",
+        "raw=", round(float(raw_deg), 1) if raw_deg is not None else None,
+        "current=", round(float(cur_deg), 1) if cur_deg is not None else None,
+        "alt=", round(float(alt_deg), 1) if alt_deg is not None else None,
+    )
+
+
 def realsense_thread():
     if args_cli.no_realsense:
         print("[RS] --no_realsense enabled, skipping RealSense thread")
@@ -462,12 +1009,25 @@ def realsense_thread():
     config.enable_stream(rs.stream.color, args_cli.rgb_width, args_cli.rgb_height, rs.format.bgr8, args_cli.fps)
     config.enable_stream(rs.stream.depth, args_cli.rgb_width, args_cli.rgb_height, rs.format.z16, args_cli.fps)
     if args_cli.use_imu_stabilization:
-        config.enable_stream(rs.stream.accel, rs.format.motion_xyz32f, 100)
         latest_imu["enabled"] = True
-        print("[IMU] accel stream enabled for V1 gravity stabilization")
+        print("[IMU V2] using separate Motion Module callback")
 
 
     profile = pipeline.start(config)
+
+    depth_profile_for_imu = None
+    try:
+        depth_profile_for_imu = profile.get_stream(rs.stream.depth)
+    except Exception as e:
+        print("[IMU WARN] could not get depth stream profile for extrinsics:", e)
+
+    imu_motion_sensor = None
+    if args_cli.use_imu_stabilization:
+        imu_motion_sensor = start_realsense_motion_module_v2(
+            accel_fps=100,
+            gyro_fps=200,
+            depth_profile=depth_profile_for_imu,
+        )
     align = rs.align(rs.stream.color)
 
     # Official librealsense post-processing chain for D4XX:
@@ -590,7 +1150,36 @@ def realsense_thread():
                 valid = len(valid_pts) >= 15
 
                 if valid:
+                    # IMU V2 diagnostic/correction path.
+                    # deproject_landmarks gives raw camera-frame landmarks in landmarks_3d_cam.
+                    # Apply current + alt IMU corrections here because this is the active RealSense path.
+                    if args_cli.use_imu_stabilization and landmarks_3d_cam is not None:
+                        raw_landmarks_3d_camera_for_imu_cmp = list(landmarks_3d_cam)
+
+                        alt_landmarks_3d_camera_for_imu_cmp = stabilize_landmarks_with_imu_v2_alt_camera_frame(
+                            raw_landmarks_3d_camera_for_imu_cmp
+                        )
+
+                        current_landmarks_3d_camera_for_imu_cmp = stabilize_landmarks_with_imu_v2_camera_frame(
+                            raw_landmarks_3d_camera_for_imu_cmp
+                        )
+
+                        debug_compare_imu_corrections(
+                            raw_landmarks_3d_camera_for_imu_cmp,
+                            current_landmarks_3d_camera_for_imu_cmp,
+                            alt_landmarks_3d_camera_for_imu_cmp,
+                        )
+
+                        landmarks_3d_isaac = [
+                            safe_rs_point_to_isaac_for_debug(pp)
+                            for pp in current_landmarks_3d_camera_for_imu_cmp
+                        ]
+
                     palm_frame = estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
+                    palm_frame = apply_palm_orientation_continuity_gate(palm_frame, max_jump_deg=999.0)
+
+                    latest_rs["palm_frame"] = palm_frame
+                    debug_print_palm_orientation_stability(palm_frame)
 
                 for a, b in MP_CONNECTIONS:
                     pa = landmarks_2d[a]
@@ -633,6 +1222,13 @@ def realsense_thread():
 
     finally:
         pipeline.stop()
+        if 'imu_motion_sensor' in locals() and imu_motion_sensor is not None:
+            try:
+                imu_motion_sensor.stop()
+                imu_motion_sensor.close()
+                print("[IMU V2] Motion Module stopped")
+            except Exception as e:
+                print("[IMU WARN] failed to stop Motion Module:", e)
         if CV_OK:
             try:
                 cv2.destroyAllWindows()
