@@ -1,3 +1,22 @@
+# ============================================================
+# RUN COMMAND - RealSense IMU-stabilized G1 right palm calibration
+#
+# cd ~/IsaacLab_5
+# ./isaaclab.sh -p scripts/calibrate_realsense_to_g1_right_palm_orientation_400.py \
+#   --device cuda:0 \
+#   --num_samples 400 \
+#   --rgb_width 640 \
+#   --rgb_height 480 \
+#   --fps 30 \
+#   --save_images \
+#   --use_imu_stabilization
+#
+# Notes:
+# - Use a mounted/rigid camera, not handheld.
+# - Save samples only when the hand viz looks stable.
+# - Current IMU correction stabilizes camera rotation; remaining noise is mostly depth/landmark palm flips.
+# ============================================================
+
 import argparse
 import json
 import math
@@ -938,6 +957,119 @@ def safe_rs_point_to_isaac_for_debug(p):
         return None
 
 
+
+def _np_point3_for_palm_debug(p):
+    import numpy as _np
+    if p is None:
+        return None
+    try:
+        if len(p) != 3:
+            return None
+        arr = _np.asarray([float(p[0]), float(p[1]), float(p[2])], dtype=_np.float32)
+        if not _np.all(_np.isfinite(arr)):
+            return None
+        return arr
+    except Exception:
+        return None
+
+
+def _quat_wxyz_from_rotmat_np(R):
+    import numpy as _np
+    R = _np.asarray(R, dtype=_np.float32)
+    tr = float(R[0, 0] + R[1, 1] + R[2, 2])
+
+    if tr > 0.0:
+        S = (tr + 1.0) ** 0.5 * 2.0
+        qw = 0.25 * S
+        qx = (R[2, 1] - R[1, 2]) / S
+        qy = (R[0, 2] - R[2, 0]) / S
+        qz = (R[1, 0] - R[0, 1]) / S
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        S = (1.0 + R[0, 0] - R[1, 1] - R[2, 2]) ** 0.5 * 2.0
+        qw = (R[2, 1] - R[1, 2]) / S
+        qx = 0.25 * S
+        qy = (R[0, 1] + R[1, 0]) / S
+        qz = (R[0, 2] + R[2, 0]) / S
+    elif R[1, 1] > R[2, 2]:
+        S = (1.0 + R[1, 1] - R[0, 0] - R[2, 2]) ** 0.5 * 2.0
+        qw = (R[0, 2] - R[2, 0]) / S
+        qx = (R[0, 1] + R[1, 0]) / S
+        qy = 0.25 * S
+        qz = (R[1, 2] + R[2, 1]) / S
+    else:
+        S = (1.0 + R[2, 2] - R[0, 0] - R[1, 1]) ** 0.5 * 2.0
+        qw = (R[1, 0] - R[0, 1]) / S
+        qx = (R[0, 2] + R[2, 0]) / S
+        qy = (R[1, 2] + R[2, 1]) / S
+        qz = 0.25 * S
+
+    q = _np.asarray([qw, qx, qy, qz], dtype=_np.float32)
+    n = float(_np.linalg.norm(q))
+    if n < 1e-8 or not _np.all(_np.isfinite(q)):
+        return None
+    q = q / n
+    return [float(v) for v in q]
+
+
+def loose_estimate_palm_frame_from_21_landmarks(points):
+    """
+    Loose palm estimator for IMU debug/fallback.
+
+    Uses only:
+      0 wrist
+      5 index MCP
+      9 middle MCP
+      17 pinky MCP
+    """
+    import numpy as _np
+
+    try:
+        wrist = _np_point3_for_palm_debug(points[0])
+        index = _np_point3_for_palm_debug(points[5])
+        middle = _np_point3_for_palm_debug(points[9])
+        pinky = _np_point3_for_palm_debug(points[17])
+    except Exception:
+        return None
+
+    if wrist is None or index is None or middle is None or pinky is None:
+        return None
+
+    across = pinky - index
+    forward = middle - wrist
+
+    an = float(_np.linalg.norm(across))
+    fn = float(_np.linalg.norm(forward))
+    if an < 1e-5 or fn < 1e-5:
+        return None
+
+    across = across / an
+    forward = forward / fn
+
+    normal = _np.cross(across, forward)
+    nn = float(_np.linalg.norm(normal))
+    if nn < 1e-5:
+        return None
+    normal = normal / nn
+
+    # Re-orthogonalize forward
+    forward = _np.cross(normal, across)
+    forward = forward / max(float(_np.linalg.norm(forward)), 1e-8)
+
+    R = _np.stack([across, forward, normal], axis=1)
+    q = _quat_wxyz_from_rotmat_np(R)
+    if q is None:
+        return None
+
+    return {
+        "quat_wxyz": q,
+        "palm_quat_isaac_wxyz": q,
+        "across_xyz": [float(v) for v in across],
+        "forward_xyz": [float(v) for v in forward],
+        "normal_xyz": [float(v) for v in normal],
+        "loose_debug_estimator": True,
+    }
+
+
 def debug_compare_imu_corrections(raw_landmarks_3d_camera, current_landmarks_3d_camera, alt_landmarks_3d_camera):
     """
     Live comparison:
@@ -950,15 +1082,25 @@ def debug_compare_imu_corrections(raw_landmarks_3d_camera, current_landmarks_3d_
     """
     import time
 
-    raw_pf = estimate_palm_frame_from_21_landmarks(
-        [safe_rs_point_to_isaac_for_debug(p) for p in raw_landmarks_3d_camera]
-    )
-    cur_pf = estimate_palm_frame_from_21_landmarks(
-        [safe_rs_point_to_isaac_for_debug(p) for p in current_landmarks_3d_camera]
-    )
-    alt_pf = estimate_palm_frame_from_21_landmarks(
-        [safe_rs_point_to_isaac_for_debug(p) for p in alt_landmarks_3d_camera]
-    )
+    raw_isaac = [safe_rs_point_to_isaac_for_debug(p) for p in raw_landmarks_3d_camera]
+    cur_isaac = [safe_rs_point_to_isaac_for_debug(p) for p in current_landmarks_3d_camera]
+    alt_isaac = [safe_rs_point_to_isaac_for_debug(p) for p in alt_landmarks_3d_camera]
+
+    raw_pf = loose_estimate_palm_frame_from_21_landmarks(raw_isaac)
+    cur_pf = loose_estimate_palm_frame_from_21_landmarks(cur_isaac)
+    alt_pf = loose_estimate_palm_frame_from_21_landmarks(alt_isaac)
+
+    def crit_status(points):
+        out = []
+        for i in [0, 5, 9, 17]:
+            ok = False
+            try:
+                pp = points[i]
+                ok = pp is not None and len(pp) == 3 and pp[0] is not None and pp[1] is not None and pp[2] is not None
+            except Exception:
+                ok = False
+            out.append(f"{i}:{'ok' if ok else 'bad'}")
+        return ",".join(out)
 
     def get_q(pf):
         if pf is None:
@@ -990,6 +1132,9 @@ def debug_compare_imu_corrections(raw_landmarks_3d_camera, current_landmarks_3d_
         "raw=", round(float(raw_deg), 1) if raw_deg is not None else None,
         "current=", round(float(cur_deg), 1) if cur_deg is not None else None,
         "alt=", round(float(alt_deg), 1) if alt_deg is not None else None,
+        "| crit raw", crit_status(raw_isaac),
+        "| cur", crit_status(cur_isaac),
+        "| alt", crit_status(alt_isaac),
     )
 
 
@@ -1176,7 +1321,9 @@ def realsense_thread():
                         ]
 
                     palm_frame = estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
-                    palm_frame = apply_palm_orientation_continuity_gate(palm_frame, max_jump_deg=999.0)
+                    if palm_frame is None:
+                        palm_frame = loose_estimate_palm_frame_from_21_landmarks(landmarks_3d_isaac)
+                    palm_frame = apply_palm_orientation_continuity_gate(palm_frame, max_jump_deg=75.0)
 
                     latest_rs["palm_frame"] = palm_frame
                     debug_print_palm_orientation_stability(palm_frame)
